@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  etcd-sentinel.sh
+#  etcd-monitor.sh
 # ------------------------------------------------------------------------------
 #  Lightweight remote ETCD cluster health monitor with Splunk/HEC integration.
 #
@@ -30,179 +30,149 @@
 # ==============================================================================
 
 set -euo pipefail
-PATH=/usr/local/bin:/usr/bin:/bin
 
-# ------------------------------------------------------------------------------
+VERSION="1.1.0"
+SERVICE_NAME="etcd_monitor"
+
+# =============================
 # Default configuration
-# ------------------------------------------------------------------------------
-SPLUNK_ENABLED=true
-SPLUNK_URL="${SPLUNK_URL:-}"
-SPLUNK_TOKEN="${SPLUNK_TOKEN:-}"
-SPLUNK_INDEX="${SPLUNK_INDEX:-cluster-logs}"
-SPLUNK_SOURCE="${SPLUNK_SOURCE:-etcd-sentinel}"
-SPLUNK_SOURCETYPE="${SPLUNK_SOURCETYPE:-etcd-sentinel-json}"
+# =============================
+SPLUNK_ENABLED=false
+OUTPUT_MODE="human"
+THRESHOLD_WARN_GB=1.5
+THRESHOLD_CRIT_GB=2
 
-SERVICE_NAME="etcd_sentinel"
-SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
-
-# ------------------------------------------------------------------------------
-# Parse arguments
-# ------------------------------------------------------------------------------
-TARGET_HOST=""
-ENVIRONMENT=""
-THRESHOLD_WARN_GB=""
-THRESHOLD_CRIT_GB=""
-
+# =============================
+# Parse CLI arguments
+# =============================
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --target) TARGET_HOST="$2"; shift 2 ;;
+    --target) TARGET="$2"; shift 2 ;;
     --env) ENVIRONMENT="$2"; shift 2 ;;
-    --splunk-url) SPLUNK_URL="$2"; shift 2 ;;
+    --splunk-url) SPLUNK_HEC_URL="$2"; SPLUNK_ENABLED=true; shift 2 ;;
     --splunk-token) SPLUNK_TOKEN="$2"; shift 2 ;;
     --index) SPLUNK_INDEX="$2"; shift 2 ;;
     --warn) THRESHOLD_WARN_GB="$2"; shift 2 ;;
     --crit) THRESHOLD_CRIT_GB="$2"; shift 2 ;;
+    --json) OUTPUT_MODE="json"; shift ;;
+    --version) echo "etcd-sentinel ${VERSION}"; exit 0 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
 
-if [[ -z "$TARGET_HOST" ]]; then
-  echo "Usage: $0 --target <remote_host> [--env <ENV>] ..."
+if [[ -z "${TARGET:-}" ]]; then
+  echo "Usage: $0 --target <hostname> [--env PROD|NOPROD] [--json] [--splunk-url ...]"
   exit 1
 fi
 
-# ------------------------------------------------------------------------------
-# Environment-specific thresholds (if not passed as args)
-# ------------------------------------------------------------------------------
-if [[ -z "$THRESHOLD_WARN_GB" || -z "$THRESHOLD_CRIT_GB" ]]; then
-  if [[ "$ENVIRONMENT" == "NOPROD" ]]; then
-      THRESHOLD_WARN_GB=3
-      THRESHOLD_CRIT_GB=4
-  else
-      ENVIRONMENT="PROD"
-      THRESHOLD_WARN_GB=1.5
-      THRESHOLD_CRIT_GB=2
-  fi
-fi
-
+# =============================
+# Thresholds conversion
+# =============================
 THRESHOLD_WARN=$(awk "BEGIN {printf \"%d\", ${THRESHOLD_WARN_GB} * 1024 * 1024 * 1024}")
 THRESHOLD_CRIT=$(awk "BEGIN {printf \"%d\", ${THRESHOLD_CRIT_GB} * 1024 * 1024 * 1024}")
 
-# ------------------------------------------------------------------------------
-# Remote ETCD query
-# ------------------------------------------------------------------------------
-echo "===> Checking ETCD status @ ${TARGET_HOST} (${ENVIRONMENT})"
-STATUS_JSON=$(ssh ${SSH_OPTS} root@"${TARGET_HOST}" \
-  "docker exec -e ETCDCTL_API=3 \$(docker ps -q -f name=ucp-kv) etcdctl --cluster=true endpoint status -w json 2>/dev/null") || {
-  echo "❌ Failed to retrieve etcd status from ${TARGET_HOST}"
-  exit 2
-}
+# =============================
+# Fetch status remotely
+# =============================
+STATUS_JSON=$(ssh -o StrictHostKeyChecking=no root@"$TARGET" \
+  "docker exec -e ETCDCTL_API=3 \$(docker ps -q -f name=ucp-kv) etcdctl --cluster=true endpoint status -w json" 2>/dev/null)
 
-if [[ -z "$STATUS_JSON" ]]; then
-  echo "❌ Empty response from ${TARGET_HOST}"
-  exit 2
-fi
-
-# ------------------------------------------------------------------------------
-# Parse JSON and compute metrics
-# ------------------------------------------------------------------------------
 AVG_BYTES=$(echo "$STATUS_JSON" | jq '[.[].Status.dbSize] | add/length')
 MAX_BYTES=$(echo "$STATUS_JSON" | jq '[.[].Status.dbSize] | max')
 RAW_LEADER=$(echo "$STATUS_JSON" | jq '.[0].Status.leader')
-LEADER_EP=$(echo "$STATUS_JSON" | jq -r --argjson lid "$RAW_LEADER" \
-  '.[] | select(.Status.header.member_id == $lid) | .Endpoint')
-
+LEADER_EP=$(echo "$STATUS_JSON" | jq -r --argjson lid "$RAW_LEADER" '.[] | select(.Status.header.member_id == $lid) | .Endpoint')
 LEADER_IP=$(echo "$LEADER_EP" | sed -E 's#https://([^:]+):.*#\1#')
-LEADER_HOST=$(getent hosts "$LEADER_IP" | awk '{print $2}' | head -n 1 || true)
 
-# ------------------------------------------------------------------------------
-# Threshold check
-# ------------------------------------------------------------------------------
+LEADER_HOST=$(getent hosts "$LEADER_IP" | awk '{print $2}' | head -n 1 || echo "$LEADER_IP")
+
 PERCENT=$(awk "BEGIN {printf \"%d\", (${MAX_BYTES} / ${THRESHOLD_CRIT}) * 100}")
-STATUS_LEVEL="OK"
-STATUS_MSG="OK: ETCD DB size within safe limits (${PERCENT}% of ${THRESHOLD_CRIT_GB} GB)"
-EXIT_CODE=0
 
 if (( MAX_BYTES >= THRESHOLD_CRIT )); then
-    STATUS_LEVEL="CRITICAL"
-    STATUS_MSG="CRITICAL: ETCD DB size exceeds ${THRESHOLD_CRIT_GB} GB (${PERCENT}%)"
-    EXIT_CODE=2
+  STATUS_LEVEL="CRITICAL"
+  STATUS_MSG="ETCD DB size exceeds ${THRESHOLD_CRIT_GB} GB (${PERCENT}%)"
+  EXIT_CODE=2
 elif (( MAX_BYTES >= THRESHOLD_WARN )); then
-    STATUS_LEVEL="WARNING"
-    STATUS_MSG="WARNING: ETCD DB size approaching limit (${PERCENT}% of ${THRESHOLD_CRIT_GB} GB)"
-    EXIT_CODE=1
+  STATUS_LEVEL="WARNING"
+  STATUS_MSG="ETCD DB size approaching limit (${PERCENT}% of ${THRESHOLD_CRIT_GB} GB)"
+  EXIT_CODE=1
+else
+  STATUS_LEVEL="OK"
+  STATUS_MSG="ETCD DB size within safe limits (${PERCENT}% of ${THRESHOLD_CRIT_GB} GB)"
+  EXIT_CODE=0
 fi
 
-# ------------------------------------------------------------------------------
-# Human-readable conversion
-# ------------------------------------------------------------------------------
-human_readable() {
-  local bytes=$1
-  if (( bytes < 1024 )); then echo "${bytes} B"
-  elif (( bytes < 1048576 )); then awk "BEGIN {printf \"%.2f KB\", $bytes/1024}"
-  elif (( bytes < 1073741824 )); then awk "BEGIN {printf \"%.2f MB\", $bytes/1024/1024}"
-  else awk "BEGIN {printf \"%.2f GB\", $bytes/1024/1024/1024}"
+# =============================
+# Output functions
+# =============================
+print_status() {
+  if [[ "$OUTPUT_MODE" == "json" ]]; then
+    jq -n \
+      --arg version "$VERSION" \
+      --arg host "$TARGET" \
+      --arg env "${ENVIRONMENT:-UNKNOWN}" \
+      --arg leader "$LEADER_HOST" \
+      --arg status "$STATUS_LEVEL" \
+      --arg message "$STATUS_MSG" \
+      --argjson avg "$AVG_BYTES" \
+      --argjson max "$MAX_BYTES" \
+      --argjson percent "$PERCENT" \
+      --arg service "$SERVICE_NAME" \
+      '{
+        version:$version,
+        environment:$env,
+        host:$host,
+        leader:$leader,
+        service:$service,
+        status:$status,
+        message:$message,
+        avg_db_size_bytes:$avg,
+        max_db_size_bytes:$max,
+        usage_percent:$percent
+      }'
+  else
+    echo "===> ETCD Summary @ ${TARGET} (${ENVIRONMENT:-UNKNOWN})"
+    echo "-----------------------------------------------------------"
+    echo "Leader:             ${LEADER_HOST}"
+    echo "Average DB size:    $(awk "BEGIN {printf \"%.2f GB\", ${AVG_BYTES}/1024/1024/1024}")"
+    echo "Maximum DB size:    $(awk "BEGIN {printf \"%.2f GB\", ${MAX_BYTES}/1024/1024/1024}")"
+    echo "Status:             ${STATUS_LEVEL}"
+    echo "Message:            ${STATUS_MSG}"
+    echo "-----------------------------------------------------------"
   fi
 }
 
-MAX_HR=$(human_readable "$MAX_BYTES")
-AVG_HR=$(human_readable "$AVG_BYTES")
-
-echo "-----------------------------------------------------------"
-echo "Leader:        ${LEADER_HOST:-N/A}"
-echo "Max DB size:   ${MAX_HR} (${PERCENT}%)"
-echo "Status:        ${STATUS_LEVEL}"
-echo "Message:       ${STATUS_MSG}"
-echo "-----------------------------------------------------------"
-
-# ------------------------------------------------------------------------------
-# Splunk HEC output (optional)
-# ------------------------------------------------------------------------------
+# =============================
+# Send to Splunk (if enabled)
+# =============================
 send_to_splunk() {
   local payload
   payload=$(jq -n \
     --arg time "$(date +%s)" \
-    --arg host "$(hostname)" \
-    --arg env "$ENVIRONMENT" \
-    --arg manager "$TARGET_HOST" \
+    --arg host "$TARGET" \
+    --arg env "${ENVIRONMENT:-UNKNOWN}" \
     --arg service "$SERVICE_NAME" \
     --arg status "$STATUS_LEVEL" \
     --arg message "$STATUS_MSG" \
-    --arg leader "${LEADER_HOST:-N/A}" \
+    --arg leader "$LEADER_HOST" \
     --argjson avg "$AVG_BYTES" \
     --argjson max "$MAX_BYTES" \
     --argjson percent "$PERCENT" \
-    --argjson exit_code "$EXIT_CODE" \
-    --arg index "$SPLUNK_INDEX" \
-    --arg source "$SPLUNK_SOURCE" \
-    --arg sourcetype "$SPLUNK_SOURCETYPE" \
     '{event:{
-        time:$time,
-        host:$host,
-        environment:$env,
-        manager:$manager,
-        service:$service,
-        status:$status,
-        message:$message,
-        leader:$leader,
-        avg_db_size_bytes:$avg,
-        max_db_size_bytes:$max,
-        usage_percent:$percent,
-        exit_code:$exit_code
-      },
-      index:$index, source:$source, sourcetype:$sourcetype}')
+      time:$time,host:$host,environment:$env,service:$service,
+      status:$status,message:$message,leader:$leader,
+      avg_db_size_bytes:$avg,max_db_size_bytes:$max,
+      usage_percent:$percent
+    }}')
 
-  if [[ -n "$SPLUNK_URL" && -n "$SPLUNK_TOKEN" ]]; then
-    curl -s -X POST "$SPLUNK_URL" \
-      -H "Authorization: Splunk ${SPLUNK_TOKEN}" \
-      -H "Content-Type: application/json" \
-      -d "$payload" >/dev/null 2>&1 || echo "⚠️ Failed to send data to Splunk"
-  fi
+  curl -s -X POST "$SPLUNK_HEC_URL" \
+    -H "Authorization: Splunk ${SPLUNK_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "$payload" >/dev/null 2>&1 || echo "⚠️ Failed to send event to Splunk"
 }
 
-if [[ "$SPLUNK_ENABLED" == true ]]; then
-  send_to_splunk
-fi
-
-echo "ETCD sentinel check completed (exit code: $EXIT_CODE)"
-exit $EXIT_CODE
+# =============================
+# Run
+# =============================
+print_status
+[[ "$SPLUNK_ENABLED" == true ]] && send_to_splunk
+exit ${EXIT_CODE:-0}
